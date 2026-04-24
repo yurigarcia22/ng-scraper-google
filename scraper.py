@@ -21,11 +21,11 @@ USER_AGENT = (
 CARD_SELECTOR = 'a.hfpxzc'
 
 
-async def _scroll_feed_to_end(page: Page, max_results: int, idle_rounds: int = 8) -> int:
+async def _scroll_feed_to_end(page: Page, max_results: int, idle_rounds: int = 12) -> int:
     """Rola o painel lateral de resultados até esgotar ou atingir max_results.
 
-    Estratégia mais paciente: 8 rounds estáveis (vs 4 antes), 3s entre rounds,
-    detecta o marker de "fim da lista" do Google Maps.
+    Estratégia agressiva: foca o painel, scroll combinado (scrollTop + wheel events),
+    sleep curto, detecta fim por marker OU 12 rounds idle.
     """
     feed_selector = 'div[role="feed"]'
     try:
@@ -34,32 +34,52 @@ async def _scroll_feed_to_end(page: Page, max_results: int, idle_rounds: int = 8
         logger.warning("Feed de resultados não apareceu")
         return 0
 
+    # Foca o painel para receber eventos de wheel
+    try:
+        await page.locator(feed_selector).first.hover()
+    except Exception:
+        pass
+
     stable = 0
     prev_count = 0
     rounds = 0
-    max_total_rounds = 80
+    max_total_rounds = 120
 
     while stable < idle_rounds and rounds < max_total_rounds:
         rounds += 1
+
+        # Scroll combinado: scrollTop + wheel + Page End
         try:
             await page.evaluate(
                 """() => {
                     const feed = document.querySelector('div[role="feed"]');
-                    if (feed) feed.scrollTo(0, feed.scrollHeight);
+                    if (!feed) return;
+                    feed.scrollTo({ top: feed.scrollHeight, behavior: 'instant' });
+                    // Dispara wheel event para garantir
+                    feed.dispatchEvent(new WheelEvent('wheel', { deltaY: 5000, bubbles: true }));
                 }"""
             )
         except Exception:
             pass
 
-        await page.wait_for_timeout(3000)
+        # Mouse wheel real sobre o painel
+        try:
+            await page.mouse.wheel(0, 4000)
+        except Exception:
+            pass
 
-        # Verifica fim da lista
-        end_marker = await page.locator(
-            'div[role="feed"] >> text=/chegou ao fim|reached the end|não há mais|no more results|fim dos resultados/i'
-        ).count()
-        if end_marker > 0:
-            logger.info(f"Fim da lista detectado após {rounds} rounds")
-            break
+        await page.wait_for_timeout(1800)
+
+        # Detecta fim da lista (texto característico ou elemento sentinel)
+        try:
+            end_marker = await page.locator(
+                'div[role="feed"] >> text=/chegou ao fim|reached the end|não há mais|no more results|fim dos resultados|você chegou ao final/i'
+            ).count()
+            if end_marker > 0:
+                logger.info(f"Fim da lista detectado após {rounds} rounds")
+                break
+        except Exception:
+            pass
 
         count = await page.locator(CARD_SELECTOR).count()
         if count == prev_count:
@@ -67,9 +87,11 @@ async def _scroll_feed_to_end(page: Page, max_results: int, idle_rounds: int = 8
         else:
             stable = 0
             prev_count = count
-            logger.info(f"Round {rounds}: {count} cards carregados")
+            if count % 10 == 0 or count - prev_count > 5:
+                logger.info(f"Round {rounds}: {count} cards carregados")
 
         if count >= max_results:
+            logger.info(f"Atingiu max_results={max_results}")
             break
 
     logger.info(f"Scroll finalizado: {prev_count} cards após {rounds} rounds")
@@ -256,7 +278,7 @@ async def scrape_multi(queries: list[str], max_per_query: int = 500) -> list[dic
             user_agent=USER_AGENT,
             locale="pt-BR",
             timezone_id="America/Sao_Paulo",
-            viewport={"width": 1280, "height": 900},
+            viewport={"width": 1280, "height": 1500},
         )
         await context.add_init_script(
             "Object.defineProperty(navigator, 'webdriver', { get: () => undefined });"
