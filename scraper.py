@@ -1,7 +1,12 @@
 """
 Google Maps scraper usando Playwright.
-Abre o Maps, rola todos resultados, extrai dados de cada empresa.
-Retorna formato compatível com o que o N8N já espera (campos do Apify).
+
+Estratégia:
+1. Abre o Maps com a busca
+2. Rola o feed lateral até carregar todos os resultados
+3. Coleta todas as URLs dos cards (href dos 'a.hfpxzc')
+4. Visita cada URL uma por uma e extrai dados do painel de detalhes
+5. Deduplica por nome e retorna
 """
 import asyncio
 import logging
@@ -17,16 +22,11 @@ USER_AGENT = (
     "Chrome/131.0.0.0 Safari/537.36"
 )
 
-# Seletor mais confiável: link âncora de cada card de resultado
 CARD_SELECTOR = 'a.hfpxzc'
 
 
 async def _scroll_feed_to_end(page: Page, max_results: int, idle_rounds: int = 20) -> int:
-    """Rola o painel lateral de resultados até esgotar ou atingir max_results.
-
-    Estratégia agressiva: foca o painel, scroll combinado (scrollTop + wheel events),
-    sleep curto, detecta fim por marker OU 12 rounds idle.
-    """
+    """Rola o feed lateral agressivamente até esgotar ou atingir max_results."""
     feed_selector = 'div[role="feed"]'
     try:
         await page.wait_for_selector(feed_selector, timeout=20000)
@@ -34,7 +34,6 @@ async def _scroll_feed_to_end(page: Page, max_results: int, idle_rounds: int = 2
         logger.warning("Feed de resultados não apareceu")
         return 0
 
-    # Foca o painel para receber eventos de wheel
     try:
         await page.locator(feed_selector).first.hover()
     except Exception:
@@ -43,32 +42,28 @@ async def _scroll_feed_to_end(page: Page, max_results: int, idle_rounds: int = 2
     stable = 0
     prev_count = 0
     rounds = 0
-    max_total_rounds = 120
+    max_total_rounds = 150
 
     while stable < idle_rounds and rounds < max_total_rounds:
         rounds += 1
 
-        # Scroll combinado: scrollTop + wheel + Page End
         try:
             await page.evaluate(
                 """() => {
                     const feed = document.querySelector('div[role="feed"]');
                     if (!feed) return;
                     feed.scrollTo({ top: feed.scrollHeight, behavior: 'instant' });
-                    // Dispara wheel event para garantir
                     feed.dispatchEvent(new WheelEvent('wheel', { deltaY: 5000, bubbles: true }));
                 }"""
             )
         except Exception:
             pass
 
-        # Mouse wheel real sobre o painel
         try:
             await page.mouse.wheel(0, 4000)
         except Exception:
             pass
 
-        # Tecla End como reforço (foca o painel se já hover)
         try:
             await page.keyboard.press("End")
         except Exception:
@@ -76,7 +71,6 @@ async def _scroll_feed_to_end(page: Page, max_results: int, idle_rounds: int = 2
 
         await page.wait_for_timeout(2200)
 
-        # Detecta fim da lista (texto característico ou elemento sentinel)
         try:
             end_marker = await page.locator(
                 'div[role="feed"] >> text=/chegou ao fim|reached the end|não há mais|no more results|fim dos resultados|você chegou ao final/i'
@@ -92,9 +86,9 @@ async def _scroll_feed_to_end(page: Page, max_results: int, idle_rounds: int = 2
             stable += 1
         else:
             stable = 0
+            if count - prev_count >= 5 or count % 10 == 0:
+                logger.info(f"Round {rounds}: {count} cards")
             prev_count = count
-            if count % 10 == 0 or count - prev_count > 5:
-                logger.info(f"Round {rounds}: {count} cards carregados")
 
         if count >= max_results:
             logger.info(f"Atingiu max_results={max_results}")
@@ -105,7 +99,7 @@ async def _scroll_feed_to_end(page: Page, max_results: int, idle_rounds: int = 2
 
 
 async def _extract_from_details(page: Page) -> dict:
-    """Extrai dados do painel de detalhes que abre ao clicar num card."""
+    """Extrai dados do painel de detalhes (com a URL em /maps/place/...)."""
     data = {
         "title": None,
         "phone": None,
@@ -116,7 +110,6 @@ async def _extract_from_details(page: Page) -> dict:
         "address": None,
     }
 
-    # Nome
     try:
         h1 = page.locator('h1.DUwDvf, h1.lfPIob').first
         if await h1.count() > 0:
@@ -124,13 +117,10 @@ async def _extract_from_details(page: Page) -> dict:
     except Exception:
         pass
 
-    # Rating + reviews — múltiplas estratégias
     try:
-        # Estratégia 1: aria-label do container "div.F7nice"
         f7 = page.locator('div.F7nice').first
         if await f7.count() > 0:
             aria = await f7.get_attribute("aria-label") or ""
-            # Formato típico: "4,5 estrelas 234 avaliações" ou "4.5 stars 234 reviews"
             m_rating = re.search(r"(\d+[,.]?\d*)\s*(?:estrela|star)", aria, re.IGNORECASE)
             if m_rating:
                 try:
@@ -144,9 +134,10 @@ async def _extract_from_details(page: Page) -> dict:
                 except ValueError:
                     pass
 
-        # Fallback: parse texto visível "4,5  (234)"
         if data["totalScore"] is None or data["reviewsCount"] == 0:
-            txt = (await f7.text_content() or "").strip() if await f7.count() > 0 else ""
+            txt = ""
+            if await f7.count() > 0:
+                txt = (await f7.text_content() or "").strip()
             if data["totalScore"] is None:
                 m = re.search(r"^\s*(\d+[,.]?\d*)", txt)
                 if m:
@@ -164,7 +155,6 @@ async def _extract_from_details(page: Page) -> dict:
     except Exception:
         pass
 
-    # Telefone
     try:
         phone_btn = page.locator('button[data-item-id^="phone:"]').first
         if await phone_btn.count() > 0:
@@ -174,7 +164,6 @@ async def _extract_from_details(page: Page) -> dict:
     except Exception:
         pass
 
-    # Website
     try:
         web_el = page.locator('a[data-item-id="authority"]').first
         if await web_el.count() > 0:
@@ -184,7 +173,6 @@ async def _extract_from_details(page: Page) -> dict:
     except Exception:
         pass
 
-    # Endereço
     try:
         addr_btn = page.locator('button[data-item-id="address"]').first
         if await addr_btn.count() > 0:
@@ -194,7 +182,6 @@ async def _extract_from_details(page: Page) -> dict:
     except Exception:
         pass
 
-    # Fotos — botão "Ver fotos"
     try:
         photos_btn = page.locator('button[aria-label*="foto"], button[aria-label*="photo"]').first
         if await photos_btn.count() > 0:
@@ -209,68 +196,85 @@ async def _extract_from_details(page: Page) -> dict:
 
 
 async def scrape_query(context: BrowserContext, query: str, max_results: int = 500) -> list[dict]:
-    """Executa uma busca no Google Maps e retorna lista de empresas."""
-    page = await context.new_page()
+    """1) Abre busca, rola, coleta URLs. 2) Visita cada URL e extrai."""
     results: list[dict] = []
 
+    # Fase 1: coletar URLs via scroll
+    list_page = await context.new_page()
+    urls: list[str] = []
     try:
-        url = f"https://www.google.com/maps/search/{query.replace(' ', '+')}/?hl=pt-BR"
-        logger.info(f"Abrindo: {url}")
-        await page.goto(url, wait_until="domcontentloaded", timeout=45000)
+        search_url = f"https://www.google.com/maps/search/{query.replace(' ', '+')}/?hl=pt-BR"
+        logger.info(f"Abrindo busca: {search_url}")
+        await list_page.goto(search_url, wait_until="domcontentloaded", timeout=45000)
 
-        # Aceita cookies se aparecer
         try:
-            btn = page.locator('button:has-text("Aceitar tudo"), button:has-text("Accept all")').first
+            btn = list_page.locator('button:has-text("Aceitar tudo"), button:has-text("Accept all")').first
             if await btn.count() > 0:
                 await btn.click(timeout=3000)
         except Exception:
             pass
 
-        # Se o Maps redirecionou direto para single result
-        if "/maps/place/" in page.url:
-            data = await _extract_from_details(page)
+        # Se redirecionou direto pra single place
+        if "/maps/place/" in list_page.url:
+            data = await _extract_from_details(list_page)
             if data.get("title"):
                 results.append(data)
+            await list_page.close()
             return results
 
-        # Rola os resultados
-        total = await _scroll_feed_to_end(page, max_results=max_results)
-        logger.info(f"Query '{query}' carregou {total} cards após scroll")
+        await _scroll_feed_to_end(list_page, max_results=max_results)
 
-        # Pega os links de todos os cards usando seletor confiável
-        cards = page.locator(CARD_SELECTOR)
-        count = await cards.count()
-        count = min(count, max_results)
-        logger.info(f"Iterando {count} cards para extrair detalhes")
+        # Coleta todas as URLs dos cards
+        hrefs = await list_page.locator(CARD_SELECTOR).evaluate_all(
+            "(els) => els.map(a => a.href).filter(Boolean)"
+        )
+        # Unique preservando ordem
+        seen_urls = set()
+        for h in hrefs:
+            if h not in seen_urls:
+                seen_urls.add(h)
+                urls.append(h)
+        logger.info(f"Query '{query}' coletou {len(urls)} URLs únicas")
+    except Exception as e:
+        logger.exception(f"Erro fase 1 de '{query}': {e}")
+    finally:
+        await list_page.close()
 
-        for i in range(count):
+    if not urls:
+        return results
+
+    # Fase 2: visitar cada URL e extrair
+    detail_page = await context.new_page()
+    try:
+        for idx, url in enumerate(urls[:max_results]):
             try:
-                card = cards.nth(i)
+                await detail_page.goto(url, wait_until="domcontentloaded", timeout=30000)
                 try:
-                    await card.scroll_into_view_if_needed(timeout=3000)
-                except Exception:
-                    pass
-                await card.click(timeout=5000)
-                await page.wait_for_timeout(1400)
-                await page.wait_for_selector('h1.DUwDvf, h1.lfPIob', timeout=6000)
+                    await detail_page.wait_for_selector('h1.DUwDvf, h1.lfPIob', timeout=8000)
+                except PlaywrightTimeout:
+                    logger.debug(f"Detail {idx+1}: h1 não apareceu")
+                    continue
 
-                data = await _extract_from_details(page)
+                # Espera extra para lazy load de botões
+                await detail_page.wait_for_timeout(800)
+
+                data = await _extract_from_details(detail_page)
                 if data.get("title"):
                     results.append(data)
+                    if (idx + 1) % 10 == 0:
+                        logger.info(f"Detail {idx+1}/{len(urls)} extraído")
             except Exception as e:
-                logger.debug(f"Card #{i} falhou: {e}")
+                logger.debug(f"URL #{idx} falhou: {e}")
                 continue
-
-    except Exception as e:
-        logger.exception(f"Erro scrapear '{query}': {e}")
     finally:
-        await page.close()
+        await detail_page.close()
 
+    logger.info(f"Query '{query}' extraiu {len(results)} empresas de {len(urls)} URLs")
     return results
 
 
 async def scrape_multi(queries: list[str], max_per_query: int = 500) -> list[dict]:
-    """Executa várias queries em sequência e agrega + deduplica por nome."""
+    """Executa várias queries, agrega e deduplica por nome."""
     async with async_playwright() as p:
         browser = await p.chromium.launch(
             headless=True,
@@ -301,7 +305,6 @@ async def scrape_multi(queries: list[str], max_per_query: int = 500) -> list[dic
         await context.close()
         await browser.close()
 
-    # Deduplicar por nome
     seen = set()
     unique = []
     for r in all_results:
