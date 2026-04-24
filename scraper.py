@@ -21,7 +21,7 @@ USER_AGENT = (
 CARD_SELECTOR = 'a.hfpxzc'
 
 
-async def _scroll_feed_to_end(page: Page, max_results: int, idle_rounds: int = 12) -> int:
+async def _scroll_feed_to_end(page: Page, max_results: int, idle_rounds: int = 20) -> int:
     """Rola o painel lateral de resultados até esgotar ou atingir max_results.
 
     Estratégia agressiva: foca o painel, scroll combinado (scrollTop + wheel events),
@@ -68,7 +68,13 @@ async def _scroll_feed_to_end(page: Page, max_results: int, idle_rounds: int = 1
         except Exception:
             pass
 
-        await page.wait_for_timeout(1800)
+        # Tecla End como reforço (foca o painel se já hover)
+        try:
+            await page.keyboard.press("End")
+        except Exception:
+            pass
+
+        await page.wait_for_timeout(2200)
 
         # Detecta fim da lista (texto característico ou elemento sentinel)
         try:
