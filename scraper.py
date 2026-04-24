@@ -17,9 +17,16 @@ USER_AGENT = (
     "Chrome/131.0.0.0 Safari/537.36"
 )
 
+# Seletor mais confiável: link âncora de cada card de resultado
+CARD_SELECTOR = 'a.hfpxzc'
 
-async def _scroll_feed_to_end(page: Page, max_results: int, idle_rounds: int = 4) -> int:
-    """Rola o painel lateral de resultados até esgotar ou atingir max_results."""
+
+async def _scroll_feed_to_end(page: Page, max_results: int, idle_rounds: int = 8) -> int:
+    """Rola o painel lateral de resultados até esgotar ou atingir max_results.
+
+    Estratégia mais paciente: 8 rounds estáveis (vs 4 antes), 3s entre rounds,
+    detecta o marker de "fim da lista" do Google Maps.
+    """
     feed_selector = 'div[role="feed"]'
     try:
         await page.wait_for_selector(feed_selector, timeout=20000)
@@ -30,7 +37,9 @@ async def _scroll_feed_to_end(page: Page, max_results: int, idle_rounds: int = 4
     stable = 0
     prev_count = 0
     rounds = 0
-    while stable < idle_rounds and rounds < 60:
+    max_total_rounds = 80
+
+    while stable < idle_rounds and rounds < max_total_rounds:
         rounds += 1
         try:
             await page.evaluate(
@@ -42,23 +51,28 @@ async def _scroll_feed_to_end(page: Page, max_results: int, idle_rounds: int = 4
         except Exception:
             pass
 
-        await page.wait_for_timeout(2200)
+        await page.wait_for_timeout(3000)
 
         # Verifica fim da lista
-        end_marker = await page.locator('div[role="feed"] >> text=/chegou ao fim|reached the end|não há mais|no more/i').count()
+        end_marker = await page.locator(
+            'div[role="feed"] >> text=/chegou ao fim|reached the end|não há mais|no more results|fim dos resultados/i'
+        ).count()
         if end_marker > 0:
+            logger.info(f"Fim da lista detectado após {rounds} rounds")
             break
 
-        count = await page.locator('div[role="feed"] > div > div[jsaction*="mouseover"]').count()
+        count = await page.locator(CARD_SELECTOR).count()
         if count == prev_count:
             stable += 1
         else:
             stable = 0
             prev_count = count
+            logger.info(f"Round {rounds}: {count} cards carregados")
 
         if count >= max_results:
             break
 
+    logger.info(f"Scroll finalizado: {prev_count} cards após {rounds} rounds")
     return prev_count
 
 
@@ -82,26 +96,43 @@ async def _extract_from_details(page: Page) -> dict:
     except Exception:
         pass
 
-    # Rating + reviews — formato "4,5 (120)" ou "4.5 (120)"
+    # Rating + reviews — múltiplas estratégias
     try:
-        rating_el = page.locator('div.F7nice span[aria-hidden="true"]').first
-        if await rating_el.count() > 0:
-            txt = (await rating_el.text_content() or "").replace(",", ".").strip()
-            if txt:
+        # Estratégia 1: aria-label do container "div.F7nice"
+        f7 = page.locator('div.F7nice').first
+        if await f7.count() > 0:
+            aria = await f7.get_attribute("aria-label") or ""
+            # Formato típico: "4,5 estrelas 234 avaliações" ou "4.5 stars 234 reviews"
+            m_rating = re.search(r"(\d+[,.]?\d*)\s*(?:estrela|star)", aria, re.IGNORECASE)
+            if m_rating:
                 try:
-                    data["totalScore"] = float(txt)
+                    data["totalScore"] = float(m_rating.group(1).replace(",", "."))
                 except ValueError:
                     pass
-    except Exception:
-        pass
+            m_reviews = re.search(r"(\d[\d\.]*)\s*(?:avalia|review)", aria, re.IGNORECASE)
+            if m_reviews:
+                try:
+                    data["reviewsCount"] = int(m_reviews.group(1).replace(".", "").replace(",", ""))
+                except ValueError:
+                    pass
 
-    try:
-        reviews_el = page.locator('div.F7nice span[aria-label*="avalia"], div.F7nice span[aria-label*="review"]').first
-        if await reviews_el.count() > 0:
-            aria = await reviews_el.get_attribute("aria-label") or ""
-            m = re.search(r"([\d\.]+)", aria.replace(".", ""))
-            if m:
-                data["reviewsCount"] = int(m.group(1))
+        # Fallback: parse texto visível "4,5  (234)"
+        if data["totalScore"] is None or data["reviewsCount"] == 0:
+            txt = (await f7.text_content() or "").strip() if await f7.count() > 0 else ""
+            if data["totalScore"] is None:
+                m = re.search(r"^\s*(\d+[,.]?\d*)", txt)
+                if m:
+                    try:
+                        data["totalScore"] = float(m.group(1).replace(",", "."))
+                    except ValueError:
+                        pass
+            if data["reviewsCount"] == 0:
+                m = re.search(r"\(([\d\.]+)\)", txt)
+                if m:
+                    try:
+                        data["reviewsCount"] = int(m.group(1).replace(".", "").replace(",", ""))
+                    except ValueError:
+                        pass
     except Exception:
         pass
 
@@ -110,7 +141,6 @@ async def _extract_from_details(page: Page) -> dict:
         phone_btn = page.locator('button[data-item-id^="phone:"]').first
         if await phone_btn.count() > 0:
             aria = await phone_btn.get_attribute("aria-label") or ""
-            # "Telefone: +55 11 9999-9999" ou "Phone: ..."
             phone = re.sub(r"^(Telefone|Phone)\s*:\s*", "", aria).strip()
             data["phone"] = phone or None
     except Exception:
@@ -136,7 +166,7 @@ async def _extract_from_details(page: Page) -> dict:
     except Exception:
         pass
 
-    # Fotos — tenta contar pelo botão de "Ver fotos" ou similar
+    # Fotos — botão "Ver fotos"
     try:
         photos_btn = page.locator('button[aria-label*="foto"], button[aria-label*="photo"]').first
         if await photos_btn.count() > 0:
@@ -168,8 +198,7 @@ async def scrape_query(context: BrowserContext, query: str, max_results: int = 5
         except Exception:
             pass
 
-        # Se o Maps redirecionou direto para a página de um lugar (single result),
-        # extrai e retorna
+        # Se o Maps redirecionou direto para single result
         if "/maps/place/" in page.url:
             data = await _extract_from_details(page)
             if data.get("title"):
@@ -178,16 +207,17 @@ async def scrape_query(context: BrowserContext, query: str, max_results: int = 5
 
         # Rola os resultados
         total = await _scroll_feed_to_end(page, max_results=max_results)
-        logger.info(f"Query '{query}' carregou {total} cards")
+        logger.info(f"Query '{query}' carregou {total} cards após scroll")
 
-        cards = page.locator('div[role="feed"] > div > div[jsaction*="mouseover"]')
+        # Pega os links de todos os cards usando seletor confiável
+        cards = page.locator(CARD_SELECTOR)
         count = await cards.count()
         count = min(count, max_results)
+        logger.info(f"Iterando {count} cards para extrair detalhes")
 
         for i in range(count):
             try:
                 card = cards.nth(i)
-                # Traz o card para a viewport
                 try:
                     await card.scroll_into_view_if_needed(timeout=3000)
                 except Exception:
@@ -228,7 +258,6 @@ async def scrape_multi(queries: list[str], max_per_query: int = 500) -> list[dic
             timezone_id="America/Sao_Paulo",
             viewport={"width": 1280, "height": 900},
         )
-        # Esconder "webdriver"
         await context.add_init_script(
             "Object.defineProperty(navigator, 'webdriver', { get: () => undefined });"
         )
@@ -244,7 +273,7 @@ async def scrape_multi(queries: list[str], max_per_query: int = 500) -> list[dic
         await context.close()
         await browser.close()
 
-    # Deduplicar por nome (lowercase, strip)
+    # Deduplicar por nome
     seen = set()
     unique = []
     for r in all_results:
