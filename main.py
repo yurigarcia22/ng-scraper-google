@@ -49,6 +49,8 @@ class Company(BaseModel):
 class ScrapeResponse(BaseModel):
     total: int
     companies: list[Company]
+    blocked: bool = False
+    reason: Optional[str] = None
 
 
 def _check_auth(api_key: Optional[str]):
@@ -69,10 +71,19 @@ async def scrape_sync(req: ScrapeRequest):
     queries = [f"{req.nicho} {c}" for c in req.cidades]
     logger.info(f"Iniciando scrape: {queries} (max={req.max_per_city}/cidade)")
 
-    results = await scrape_multi(queries, req.max_per_city)
+    result = await scrape_multi(queries, req.max_per_city)
+    companies = result["companies"]
 
-    logger.info(f"Scrape concluído: {len(results)} empresas únicas")
-    return ScrapeResponse(total=len(results), companies=results)
+    logger.info(
+        f"Scrape concluído: {len(companies)} empresas | "
+        f"bloqueado: {result['blocked']} | razão: {result['reason']}"
+    )
+    return ScrapeResponse(
+        total=len(companies),
+        companies=companies,
+        blocked=result["blocked"],
+        reason=result["reason"],
+    )
 
 
 # ─── Async mode (para N8N evitar timeout) ──────────────────────────────────
@@ -83,9 +94,14 @@ async def _run_job(job_id: str, req: ScrapeRequest):
     JOBS[job_id]["status"] = "running"
     try:
         queries = [f"{req.nicho} {c}" for c in req.cidades]
-        results = await scrape_multi(queries, req.max_per_city)
+        result = await scrape_multi(queries, req.max_per_city)
         JOBS[job_id]["status"] = "done"
-        JOBS[job_id]["result"] = {"total": len(results), "companies": results}
+        JOBS[job_id]["result"] = {
+            "total": len(result["companies"]),
+            "companies": result["companies"],
+            "blocked": result["blocked"],
+            "reason": result["reason"],
+        }
     except Exception as e:
         logger.exception(f"Job {job_id} falhou")
         JOBS[job_id]["status"] = "error"

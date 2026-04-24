@@ -2,28 +2,63 @@
 Google Maps scraper usando Playwright.
 
 Estratégia:
-1. Abre o Maps com a busca
-2. Rola o feed lateral até carregar todos os resultados
-3. Coleta todas as URLs dos cards (href dos 'a.hfpxzc')
-4. Visita cada URL uma por uma e extrai dados do painel de detalhes
-5. Deduplica por nome e retorna
+1. Fase 1: abre busca, rola todo o feed lateral, coleta URLs dos cards
+2. Fase 2: visita URLs em paralelo (3 abas) e extrai dados de cada uma
+3. Detecta bloqueios do Google (captcha, bot detection) e aborta cedo
+4. Delay aleatório entre requests + rotação de user-agent
 """
 import asyncio
 import logging
+import random
 import re
 from typing import Optional
-from playwright.async_api import async_playwright, Page, BrowserContext, TimeoutError as PlaywrightTimeout
+from playwright.async_api import (
+    async_playwright, Page, BrowserContext,
+    TimeoutError as PlaywrightTimeout,
+)
 
 logger = logging.getLogger(__name__)
 
-USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/131.0.0.0 Safari/537.36"
-)
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+]
 
 CARD_SELECTOR = 'a.hfpxzc'
 
+CONCURRENCY = 3  # Fase 2: quantas abas em paralelo
+
+
+# ─── Detecção de bloqueio ───────────────────────────────────────────────────
+
+async def _detect_block(page: Page) -> Optional[str]:
+    """Retorna motivo do bloqueio ou None se está ok."""
+    try:
+        url = page.url or ""
+        if "/sorry/" in url or "sorry.google" in url or "/recaptcha/" in url:
+            return "captcha_redirect"
+    except Exception:
+        pass
+
+    try:
+        patterns = re.compile(
+            r"tráfego incomum|unusual traffic|systems have detected|"
+            r"verificar que você é humano|not a robot|sou um ser humano|"
+            r"detectamos atividade|automated queries|computador está enviando",
+            re.IGNORECASE,
+        )
+        body = await page.locator("body").text_content(timeout=2000) or ""
+        if patterns.search(body[:5000]):
+            return "bot_detection"
+    except Exception:
+        pass
+
+    return None
+
+
+# ─── Fase 1: scroll e coleta de URLs ────────────────────────────────────────
 
 async def _scroll_feed_to_end(page: Page, max_results: int, idle_rounds: int = 20) -> int:
     """Rola o feed lateral agressivamente até esgotar ou atingir max_results."""
@@ -46,7 +81,6 @@ async def _scroll_feed_to_end(page: Page, max_results: int, idle_rounds: int = 2
 
     while stable < idle_rounds and rounds < max_total_rounds:
         rounds += 1
-
         try:
             await page.evaluate(
                 """() => {
@@ -98,8 +132,57 @@ async def _scroll_feed_to_end(page: Page, max_results: int, idle_rounds: int = 2
     return prev_count
 
 
+async def _collect_urls(context: BrowserContext, query: str, max_results: int) -> tuple[list[str], Optional[str]]:
+    """Abre a busca, rola, coleta URLs. Retorna (urls, blocked_reason)."""
+    page = await context.new_page()
+    urls: list[str] = []
+    blocked: Optional[str] = None
+
+    try:
+        search_url = f"https://www.google.com/maps/search/{query.replace(' ', '+')}/?hl=pt-BR"
+        logger.info(f"Abrindo busca: {search_url}")
+        await page.goto(search_url, wait_until="domcontentloaded", timeout=45000)
+
+        blocked = await _detect_block(page)
+        if blocked:
+            logger.warning(f"Bloqueio detectado na fase 1: {blocked}")
+            return urls, blocked
+
+        try:
+            btn = page.locator('button:has-text("Aceitar tudo"), button:has-text("Accept all")').first
+            if await btn.count() > 0:
+                await btn.click(timeout=3000)
+        except Exception:
+            pass
+
+        # Single place result
+        if "/maps/place/" in page.url:
+            urls.append(page.url)
+            return urls, None
+
+        await _scroll_feed_to_end(page, max_results=max_results)
+
+        hrefs = await page.locator(CARD_SELECTOR).evaluate_all(
+            "(els) => els.map(a => a.href).filter(Boolean)"
+        )
+        seen = set()
+        for h in hrefs:
+            if h not in seen:
+                seen.add(h)
+                urls.append(h)
+        logger.info(f"Query '{query}' coletou {len(urls)} URLs únicas")
+    except Exception as e:
+        logger.exception(f"Erro fase 1 de '{query}': {e}")
+    finally:
+        await page.close()
+
+    return urls, blocked
+
+
+# ─── Fase 2: extração por URL ────────────────────────────────────────────────
+
 async def _extract_from_details(page: Page) -> dict:
-    """Extrai dados do painel de detalhes (com a URL em /maps/place/...)."""
+    """Extrai dados do painel de detalhes (página /maps/place/...)."""
     data = {
         "title": None,
         "phone": None,
@@ -195,86 +278,82 @@ async def _extract_from_details(page: Page) -> dict:
     return data
 
 
-async def scrape_query(context: BrowserContext, query: str, max_results: int = 500) -> list[dict]:
-    """1) Abre busca, rola, coleta URLs. 2) Visita cada URL e extrai."""
-    results: list[dict] = []
+async def _scrape_one_url(
+    context: BrowserContext,
+    url: str,
+    semaphore: asyncio.Semaphore,
+    block_flag: dict,
+) -> Optional[dict]:
+    """Visita uma URL e extrai. Aborta se block_flag indica bloqueio."""
+    async with semaphore:
+        if block_flag.get("reason"):
+            return None
 
-    # Fase 1: coletar URLs via scroll
-    list_page = await context.new_page()
-    urls: list[str] = []
-    try:
-        search_url = f"https://www.google.com/maps/search/{query.replace(' ', '+')}/?hl=pt-BR"
-        logger.info(f"Abrindo busca: {search_url}")
-        await list_page.goto(search_url, wait_until="domcontentloaded", timeout=45000)
+        # Delay humano aleatório entre 0.8 e 2.5s
+        await asyncio.sleep(random.uniform(0.8, 2.5))
 
+        page = await context.new_page()
         try:
-            btn = list_page.locator('button:has-text("Aceitar tudo"), button:has-text("Accept all")').first
-            if await btn.count() > 0:
-                await btn.click(timeout=3000)
-        except Exception:
-            pass
+            await page.goto(url, wait_until="domcontentloaded", timeout=30000)
 
-        # Se redirecionou direto pra single place
-        if "/maps/place/" in list_page.url:
-            data = await _extract_from_details(list_page)
-            if data.get("title"):
-                results.append(data)
-            await list_page.close()
-            return results
+            blocked = await _detect_block(page)
+            if blocked:
+                block_flag["reason"] = blocked
+                logger.warning(f"Bloqueio detectado na fase 2: {blocked}")
+                return None
 
-        await _scroll_feed_to_end(list_page, max_results=max_results)
-
-        # Coleta todas as URLs dos cards
-        hrefs = await list_page.locator(CARD_SELECTOR).evaluate_all(
-            "(els) => els.map(a => a.href).filter(Boolean)"
-        )
-        # Unique preservando ordem
-        seen_urls = set()
-        for h in hrefs:
-            if h not in seen_urls:
-                seen_urls.add(h)
-                urls.append(h)
-        logger.info(f"Query '{query}' coletou {len(urls)} URLs únicas")
-    except Exception as e:
-        logger.exception(f"Erro fase 1 de '{query}': {e}")
-    finally:
-        await list_page.close()
-
-    if not urls:
-        return results
-
-    # Fase 2: visitar cada URL e extrair
-    detail_page = await context.new_page()
-    try:
-        for idx, url in enumerate(urls[:max_results]):
             try:
-                await detail_page.goto(url, wait_until="domcontentloaded", timeout=30000)
-                try:
-                    await detail_page.wait_for_selector('h1.DUwDvf, h1.lfPIob', timeout=8000)
-                except PlaywrightTimeout:
-                    logger.debug(f"Detail {idx+1}: h1 não apareceu")
-                    continue
+                await page.wait_for_selector('h1.DUwDvf, h1.lfPIob', timeout=8000)
+            except PlaywrightTimeout:
+                return None
 
-                # Espera extra para lazy load de botões
-                await detail_page.wait_for_timeout(800)
-
-                data = await _extract_from_details(detail_page)
-                if data.get("title"):
-                    results.append(data)
-                    if (idx + 1) % 10 == 0:
-                        logger.info(f"Detail {idx+1}/{len(urls)} extraído")
-            except Exception as e:
-                logger.debug(f"URL #{idx} falhou: {e}")
-                continue
-    finally:
-        await detail_page.close()
-
-    logger.info(f"Query '{query}' extraiu {len(results)} empresas de {len(urls)} URLs")
-    return results
+            await page.wait_for_timeout(700)
+            data = await _extract_from_details(page)
+            return data if data.get("title") else None
+        except Exception as e:
+            logger.debug(f"URL falhou: {e}")
+            return None
+        finally:
+            await page.close()
 
 
-async def scrape_multi(queries: list[str], max_per_query: int = 500) -> list[dict]:
-    """Executa várias queries, agrega e deduplica por nome."""
+# ─── Orquestração ───────────────────────────────────────────────────────────
+
+async def scrape_query(
+    context: BrowserContext,
+    query: str,
+    max_results: int = 500,
+) -> tuple[list[dict], Optional[str]]:
+    """Retorna (results, blocked_reason) para uma query."""
+    urls, blocked = await _collect_urls(context, query, max_results)
+    if blocked:
+        return [], blocked
+    if not urls:
+        return [], None
+
+    urls = urls[:max_results]
+    semaphore = asyncio.Semaphore(CONCURRENCY)
+    block_flag: dict = {}
+
+    tasks = [_scrape_one_url(context, url, semaphore, block_flag) for url in urls]
+    done = await asyncio.gather(*tasks, return_exceptions=True)
+
+    results: list[dict] = []
+    for d in done:
+        if isinstance(d, dict):
+            results.append(d)
+
+    logger.info(
+        f"Query '{query}': {len(results)} empresas de {len(urls)} URLs "
+        f"(bloqueio: {block_flag.get('reason') or 'não'})"
+    )
+    return results, block_flag.get("reason")
+
+
+async def scrape_multi(queries: list[str], max_per_query: int = 500) -> dict:
+    """Executa todas as queries, agrega, deduplica. Retorna {companies, blocked, reason}."""
+    blocked_reason: Optional[str] = None
+
     async with async_playwright() as p:
         browser = await p.chromium.launch(
             headless=True,
@@ -285,10 +364,13 @@ async def scrape_multi(queries: list[str], max_per_query: int = 500) -> list[dic
             ],
         )
         context = await browser.new_context(
-            user_agent=USER_AGENT,
+            user_agent=random.choice(USER_AGENTS),
             locale="pt-BR",
             timezone_id="America/Sao_Paulo",
             viewport={"width": 1280, "height": 1500},
+            extra_http_headers={
+                "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8",
+            },
         )
         await context.add_init_script(
             "Object.defineProperty(navigator, 'webdriver', { get: () => undefined });"
@@ -296,15 +378,21 @@ async def scrape_multi(queries: list[str], max_per_query: int = 500) -> list[dic
 
         all_results: list[dict] = []
         for q in queries:
+            if blocked_reason:
+                break
             try:
-                r = await scrape_query(context, q, max_per_query)
-                all_results.extend(r)
+                results, block = await scrape_query(context, q, max_per_query)
+                all_results.extend(results)
+                if block:
+                    blocked_reason = block
+                    break
             except Exception as e:
                 logger.exception(f"Query '{q}' falhou: {e}")
 
         await context.close()
         await browser.close()
 
+    # Dedup por nome
     seen = set()
     unique = []
     for r in all_results:
@@ -313,4 +401,8 @@ async def scrape_multi(queries: list[str], max_per_query: int = 500) -> list[dic
             seen.add(name)
             unique.append(r)
 
-    return unique
+    return {
+        "companies": unique,
+        "blocked": blocked_reason is not None,
+        "reason": blocked_reason,
+    }
